@@ -677,7 +677,7 @@ with tab_run:
     st.markdown("#### Run options")
     rc1, rc2, rc3 = st.columns(3)
     with rc1:
-        max_turns = st.number_input("Max orchestrator turns", min_value=5, max_value=200,
+        max_turns = st.number_input("Max orchestrator turns", min_value=1, max_value=200,
                                     value=40, step=5, help="Safety stop for the orchestrator loop.")
     with rc2:
         run_id_override = st.text_input("Run ID (optional)",
@@ -686,24 +686,109 @@ with tab_run:
         push_on_complete = st.checkbox("Push to bdlb/runs/ on complete", value=False,
                                        help="When the run finishes, commit every produced file to the bdlb pipeline repo.")
 
-    can_run = bool(seed_file and orchestrator_model and connected)
-    start = st.button("▶️ Start run", type="primary", disabled=not can_run, use_container_width=True)
+    # --- Manual gating controls ---
+    st.markdown("#### 🚫 Manual approval gates")
+    st.caption(
+        "Pause the pipeline before each phase you want to inspect. The run will stop, "
+        "show you everything produced so far, and wait for you to click **▶️ Continue**. "
+        "Use **Manual mode** to also pause after every single orchestrator turn."
+    )
+    mg_cols = st.columns([1, 3])
+    with mg_cols[0]:
+        pause_every_turn_ui = st.checkbox(
+            "🔍 Manual mode",
+            value=False,
+            help="Pause after EVERY orchestrator turn (one dispatch wave at a time). Strongest control — useful while you tune prompts.",
+        )
+    with mg_cols[1]:
+        phase_opts = ["P1", "P2", "P3", "P4", "P5", "P6"]
+        pause_before_ui = st.multiselect(
+            "⏸️ Pause before phase\u2026",
+            options=phase_opts,
+            default=[],
+            help="When the orchestrator transitions into one of these phases, the pipeline halts and waits for your approval.",
+            disabled=pause_every_turn_ui,
+        )
+
+    # --- Buttons row ---
+    is_resumable = st.session_state.get("run_paused_state") is not None
+    can_run = bool(seed_file and orchestrator_model and connected) and not is_resumable
+    btn_cols = st.columns([3, 1])
+    with btn_cols[0]:
+        start = st.button("▶️ Start run", type="primary", disabled=not can_run, use_container_width=True)
+    with btn_cols[1]:
+        cancel_paused = st.button("🗑️ Discard paused run",
+                                  disabled=not is_resumable, use_container_width=True)
+    if cancel_paused:
+        for k in ("run_paused_state", "run_log", "run_seed_bytes", "run_seed_name",
+                  "run_orch_model", "run_pause_before", "run_pause_every",
+                  "run_max_turns", "run_push_on_complete"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    if is_resumable:
+        paused: engine.RunState = st.session_state["run_paused_state"]
+        cur_phase = paused.build_state.get("current_phase", "?")
+        st.info(
+            f"⏸️ **Paused** — run `{paused.run_id}` is waiting at phase **{cur_phase}** "
+            f"(turn {paused.turn}, ${paused.total_cost_usd:,.4f} so far). "
+            "Review the cards below, then continue."
+        )
 
     # Live stream container
     live = st.container(border=True)
 
-    if start and can_run:
-        import asyncio
-        import io
+    # --- Continue button (only when paused) ---
+    continue_clicked = False
+    if is_resumable:
+        continue_clicked = st.button("▶️ Continue from where we paused",
+                                     type="primary", use_container_width=True)
 
-        seed_bytes = seed_file.getvalue()
-        seed_name = seed_file.name
-        run_id = (run_id_override.strip()
-                  or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    # Resolve whether we should run this script invocation
+    should_run = (start and can_run) or continue_clicked
+
+    if should_run:
+        import asyncio
+
+        resuming = continue_clicked
+        if resuming:
+            saved_state: engine.RunState = st.session_state["run_paused_state"]
+            seed_bytes = st.session_state.get("run_seed_bytes") or saved_state.seed_image_bytes or b""
+            seed_name = st.session_state.get("run_seed_name") or saved_state.seed_image_name
+            run_id = saved_state.run_id
+            # Re-read the prior settings (so the model picks etc. don't matter on resume)
+            orchestrator_model_eff = st.session_state.get("run_orch_model", orchestrator_model)
+            pause_before_eff = set(st.session_state.get("run_pause_before", pause_before_ui))
+            pause_every_eff = bool(st.session_state.get("run_pause_every", pause_every_turn_ui))
+            max_turns_eff = int(st.session_state.get("run_max_turns", max_turns))
+            push_on_complete_eff = bool(st.session_state.get("run_push_on_complete", push_on_complete))
+            log_entries: list[dict] = st.session_state.get("run_log", [])
+        else:
+            seed_bytes = seed_file.getvalue()
+            seed_name = seed_file.name
+            run_id = (run_id_override.strip()
+                      or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+            orchestrator_model_eff = orchestrator_model
+            pause_before_eff = set(pause_before_ui)
+            pause_every_eff = bool(pause_every_turn_ui)
+            max_turns_eff = int(max_turns)
+            push_on_complete_eff = bool(push_on_complete)
+            saved_state = None
+            log_entries = []
+            # Stash these so a future resume uses the same settings
+            st.session_state["run_seed_bytes"] = seed_bytes
+            st.session_state["run_seed_name"] = seed_name
+            st.session_state["run_orch_model"] = orchestrator_model_eff
+            st.session_state["run_pause_before"] = list(pause_before_eff)
+            st.session_state["run_pause_every"] = pause_every_eff
+            st.session_state["run_max_turns"] = max_turns_eff
+            st.session_state["run_push_on_complete"] = push_on_complete_eff
 
         # Show the seed image up top
-        live.markdown(f"##### 🌱 Seed: `{seed_name}`  ·  run_id: `{run_id}`")
-        live.image(seed_bytes, width=320)
+        live.markdown(f"##### 🌱 Seed: `{seed_name}`  ·  run_id: `{run_id}`"
+                      + ("  ·  🔄 resuming" if resuming else ""))
+        if seed_bytes:
+            live.image(seed_bytes, width=320)
 
         # Metrics row that updates as events stream in
         live.divider()
@@ -712,12 +797,71 @@ with tab_run:
         m_phase = metric_row[1].empty()
         m_cost = metric_row[2].empty()
         m_tokens = metric_row[3].empty()
-        m_turn.metric("Turn", 0)
-        m_phase.metric("Phase", "—")
-        m_cost.metric("Cost", "$0.00")
-        m_tokens.metric("Tokens", "0")
+        if saved_state is not None:
+            m_turn.metric("Turn", saved_state.turn)
+            m_phase.metric("Phase", saved_state.build_state.get("current_phase", "—"))
+            m_cost.metric("Cost", f"${saved_state.total_cost_usd:,.4f}")
+            m_tokens.metric("Tokens",
+                            f"{saved_state.total_tokens_in + saved_state.total_tokens_out:,}")
+        else:
+            m_turn.metric("Turn", 0)
+            m_phase.metric("Phase", "—")
+            m_cost.metric("Cost", "$0.00")
+            m_tokens.metric("Tokens", "0")
 
         log_area = live.container()
+
+        # Replay any prior log entries from the previous (paused) chunk
+        def _render_log_entry(entry: dict):
+            t = entry["type"]
+            if t == "info":
+                log_area.info(entry["msg"])
+            elif t == "success":
+                log_area.success(entry["msg"])
+            elif t == "warning":
+                log_area.warning(entry["msg"])
+            elif t == "error":
+                log_area.error(entry["msg"])
+            elif t == "orchestrator_turn":
+                r = entry["record"]
+                title = f"🧠 Turn {r.turn} — Orchestrator  ·  {r.model}  ·  ${r.cost_usd:.4f}"
+                with log_area.expander(title, expanded=False):
+                    if r.error:
+                        st.error(r.error)
+                    st.caption("Decision (parsed):")
+                    st.json(r.decision_parsed)
+                    with st.expander("Prompt sent (system)", expanded=False):
+                        st.code(r.prompt_system[:4000] + ("\n…[truncated]" if len(r.prompt_system) > 4000 else ""))
+                    with st.expander("Prompt sent (user)", expanded=False):
+                        st.code(r.prompt_user)
+                    with st.expander("Raw response", expanded=False):
+                        st.code(r.decision_raw)
+            elif t == "agent_call":
+                r2 = entry["record"]
+                icon = "❌" if r2.error else "✅"
+                title = (f"{icon} Turn {r2.turn} — {r2.agent} ({r2.task_name})  ·  "
+                         f"{r2.model}  ·  {r2.tokens_in:,} in / {r2.tokens_out:,} out  ·  "
+                         f"${r2.cost_usd:.4f}  ·  {r2.elapsed_ms/1000:.1f}s")
+                with log_area.expander(title, expanded=False):
+                    if r2.error:
+                        st.error(r2.error)
+                    if r2.output_path:
+                        st.caption(f"Output path: `{r2.output_path}`")
+                    st.caption("Output:")
+                    try:
+                        obj = json.loads(r2.output_text)
+                        st.json(obj)
+                    except Exception:
+                        st.code(r2.output_text[:6000] +
+                                ("\n…[truncated]" if len(r2.output_text) > 6000 else ""))
+                    with st.expander("Prompt sent (system, agent spec)", expanded=False):
+                        st.code(r2.prompt_system[:4000] +
+                                ("\n…[truncated]" if len(r2.prompt_system) > 4000 else ""))
+                    with st.expander("Prompt sent (user, inputs)", expanded=False):
+                        st.code(r2.prompt_user)
+
+        for entry in log_entries:
+            _render_log_entry(entry)
 
         spec_loader = agent_spec_loader_github()
 
@@ -728,19 +872,23 @@ with tab_run:
                 seed_image_name=seed_name,
                 grade_hint=grade_hint,
                 spec_loader=spec_loader,
-                orchestrator_model=orchestrator_model,
+                orchestrator_model=orchestrator_model_eff,
                 model_for_agent=model_for_agent,
                 api_keys=api_keys,
-                max_turns=int(max_turns),
+                max_turns=max_turns_eff,
+                pause_before_phases=pause_before_eff,
+                pause_every_turn=pause_every_eff,
+                resume_state=saved_state,
             ):
                 yield ev
 
         # Drain the async generator
         loop = asyncio.new_event_loop()
+        was_paused = False
         try:
             asyncio.set_event_loop(loop)
             agen = _drive()
-            final_state: engine.RunState | None = None
+            final_state: engine.RunState | None = saved_state
             while True:
                 try:
                     ev = loop.run_until_complete(agen.__anext__())
@@ -757,56 +905,48 @@ with tab_run:
 
                 t = ev["type"]
                 if t == "started":
-                    log_area.info("Run started.")
+                    entry = {"type": "info", "msg": "Run started."}
+                    log_entries.append(entry); _render_log_entry(entry)
                 elif t == "orchestrator_turn":
-                    r: engine.OrchestratorTurnRecord = ev["record"]
-                    title = f"🧠 Turn {r.turn} — Orchestrator  ·  {r.model}  ·  ${r.cost_usd:.4f}"
-                    with log_area.expander(title, expanded=False):
-                        if r.error:
-                            st.error(r.error)
-                        st.caption(f"Decision (parsed):")
-                        st.json(r.decision_parsed)
-                        with st.expander("Prompt sent (system)", expanded=False):
-                            st.code(r.prompt_system[:4000] + ("\n…[truncated]" if len(r.prompt_system) > 4000 else ""))
-                        with st.expander("Prompt sent (user)", expanded=False):
-                            st.code(r.prompt_user)
-                        with st.expander("Raw response", expanded=False):
-                            st.code(r.decision_raw)
+                    entry = {"type": "orchestrator_turn", "record": ev["record"]}
+                    log_entries.append(entry); _render_log_entry(entry)
                 elif t == "phase_change":
-                    log_area.success(f"→ Phase {ev['phase']} ({ev['status']})")
+                    entry = {"type": "success", "msg": f"→ Phase {ev['phase']} ({ev['status']})"}
+                    log_entries.append(entry); _render_log_entry(entry)
                 elif t == "agent_call":
-                    r2: engine.AgentCallRecord = ev["record"]
-                    icon = "❌" if r2.error else "✅"
-                    title = (f"{icon} Turn {r2.turn} — {r2.agent} ({r2.task_name})  ·  "
-                             f"{r2.model}  ·  {r2.tokens_in:,} in / {r2.tokens_out:,} out  ·  "
-                             f"${r2.cost_usd:.4f}  ·  {r2.elapsed_ms/1000:.1f}s")
-                    with log_area.expander(title, expanded=False):
-                        if r2.error:
-                            st.error(r2.error)
-                        if r2.output_path:
-                            st.caption(f"Output path: `{r2.output_path}`")
-                        st.caption("Output:")
-                        # Try pretty JSON if applicable
-                        try:
-                            obj = json.loads(r2.output_text)
-                            st.json(obj)
-                        except Exception:
-                            st.code(r2.output_text[:6000] +
-                                    ("\n…[truncated]" if len(r2.output_text) > 6000 else ""))
-                        with st.expander("Prompt sent (system, agent spec)", expanded=False):
-                            st.code(r2.prompt_system[:4000] +
-                                    ("\n…[truncated]" if len(r2.prompt_system) > 4000 else ""))
-                        with st.expander("Prompt sent (user, inputs)", expanded=False):
-                            st.code(r2.prompt_user)
+                    entry = {"type": "agent_call", "record": ev["record"]}
+                    log_entries.append(entry); _render_log_entry(entry)
+                elif t == "paused":
+                    was_paused = True
+                    entry = {"type": "warning", "msg": f"⏸️ Paused: {ev['reason']}"}
+                    log_entries.append(entry); _render_log_entry(entry)
                 elif t == "error":
-                    log_area.error(ev["message"])
+                    entry = {"type": "error", "msg": ev["message"]}
+                    log_entries.append(entry); _render_log_entry(entry)
                 elif t == "done":
-                    log_area.success("🏁 Run complete.")
+                    entry = {"type": "success", "msg": "🏁 Run complete."}
+                    log_entries.append(entry); _render_log_entry(entry)
         finally:
             loop.close()
 
+        # Persist or clear paused state
+        if was_paused and final_state is not None:
+            # Strip seed bytes from the saved state to keep session_state light;
+            # we kept seed_bytes separately in run_seed_bytes for resume.
+            final_state.seed_image_bytes = None
+            st.session_state["run_paused_state"] = final_state
+            st.session_state["run_log"] = log_entries
+            st.rerun()
+        else:
+            # Run finished (success or error) — clear any prior pause
+            for k in ("run_paused_state", "run_log", "run_seed_bytes", "run_seed_name",
+                      "run_orch_model", "run_pause_before", "run_pause_every",
+                      "run_max_turns", "run_push_on_complete"):
+                st.session_state.pop(k, None)
+
         # Optional: push run artifacts back to GitHub bdlb/runs/{run_id}/
-        if final_state and push_on_complete and connected:
+        # Only on actual completion, not on pause.
+        if final_state and not was_paused and push_on_complete_eff and connected and final_state.done:
             client = github_client()
             if client is not None:
                 try:

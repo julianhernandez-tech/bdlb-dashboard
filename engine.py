@@ -586,6 +586,9 @@ async def run_pipeline(
     model_for_agent: Callable[[str], str],
     api_keys: dict[str, str],
     max_turns: int = MAX_TURNS_DEFAULT,
+    pause_before_phases: set[str] | None = None,
+    pause_every_turn: bool = False,
+    resume_state: "RunState | None" = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run the pipeline end-to-end, yielding events for the dashboard.
 
@@ -594,20 +597,48 @@ async def run_pipeline(
       {"type": "orchestrator_turn", "record": OrchestratorTurnRecord, "state": RunState}
       {"type": "agent_call", "record": AgentCallRecord, "state": RunState}
       {"type": "phase_change", "phase": str, "status": str, "state": RunState}
+      {"type": "paused", "reason": str, "phase": str, "state": RunState}
       {"type": "error", "message": str, "state": RunState}
       {"type": "done", "state": RunState}
+
+    Manual gating:
+      - `pause_before_phases`: set of phase IDs (e.g. {"P1", "P3"}) — when the
+        orchestrator transitions into one of these phases, the engine yields a
+        `paused` event and returns. The caller can later resume by calling
+        `run_pipeline` again with `resume_state=<saved RunState>`.
+      - `pause_every_turn`: if True, pause after every orchestrator turn
+        (one wave of dispatches at a time).
+      - `resume_state`: pass a previously yielded RunState to continue. When
+        provided, `seed_image_bytes` / `grade_hint` / `run_id` are ignored —
+        they come from the state.
     """
-    state = RunState(
-        run_id=run_id,
-        seed_image_bytes=seed_image_bytes,
-        seed_image_name=seed_image_name,
-        grade_hint=grade_hint,
-    )
-    # Seed image is treated as a "written file" so the orchestrator sees it
-    state.files[f"bdlb/runs/{run_id}/seed/{seed_image_name}"] = "(binary image — provided as vision input to vision-capable agents)"
+    if resume_state is not None:
+        state = resume_state
+        # Restore seed bytes (UI strips them from session_state on resume
+        # to keep things small — re-inject from the call site)
+        if seed_image_bytes is not None and not state.seed_image_bytes:
+            state.seed_image_bytes = seed_image_bytes
+        seed_image_bytes = state.seed_image_bytes  # type: ignore[assignment]
+        seed_image_name = state.seed_image_name
+        grade_hint = state.grade_hint
+        run_id = state.run_id
+        # Don't re-yield 'started' on resume
+        emit_started = False
+    else:
+        state = RunState(
+            run_id=run_id,
+            seed_image_bytes=seed_image_bytes,
+            seed_image_name=seed_image_name,
+            grade_hint=grade_hint,
+        )
+        # Seed image is treated as a "written file" so the orchestrator sees it
+        state.files[f"bdlb/runs/{run_id}/seed/{seed_image_name}"] = "(binary image — provided as vision input to vision-capable agents)"
+        emit_started = True
 
-    yield {"type": "started", "state": state}
+    if emit_started:
+        yield {"type": "started", "state": state}
 
+    pause_before_phases = pause_before_phases or set()
     last_outputs: list[AgentCallRecord] = []
     prev_phase = state.build_state.get("current_phase")
 
@@ -691,13 +722,23 @@ async def run_pipeline(
             state.build_state["notes"] = su["notes"]
 
         if state.build_state.get("current_phase") != prev_phase:
+            new_phase = state.build_state.get("current_phase")
             yield {
                 "type": "phase_change",
-                "phase": state.build_state.get("current_phase"),
+                "phase": new_phase,
                 "status": state.build_state.get("current_phase_status"),
                 "state": state,
             }
-            prev_phase = state.build_state.get("current_phase")
+            prev_phase = new_phase
+            # Manual gate: pause if user marked this phase for approval
+            if new_phase in pause_before_phases:
+                yield {
+                    "type": "paused",
+                    "reason": f"Manual approval required before {new_phase}",
+                    "phase": new_phase,
+                    "state": state,
+                }
+                return
 
         if decision.get("done"):
             state.done = True
@@ -747,6 +788,16 @@ async def run_pipeline(
             yield {"type": "agent_call", "record": r, "state": state}
 
         last_outputs = results
+
+        # Manual gate: pause after every turn if requested
+        if pause_every_turn:
+            yield {
+                "type": "paused",
+                "reason": f"Manual mode: paused after turn {state.turn}",
+                "phase": state.build_state.get("current_phase"),
+                "state": state,
+            }
+            return
 
     if not state.done:
         yield {"type": "error", "message": f"Hit max_turns ({max_turns}) without completion.", "state": state}
