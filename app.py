@@ -1,5 +1,5 @@
 """
-BDLB Run Dashboard — Steps 1–7 complete
+BDLB Run Dashboard — generation engine + monitoring
 
 Monitoring and control dashboard for BDLB (Backward-Design Lesson Builder),
 a multi-agent AI pipeline that turns a STAAR-style math question image into a
@@ -36,11 +36,13 @@ except Exception:
 
 from github import Github, GithubException, UnknownObjectException
 
+import engine  # generation engine: orchestrator loop + provider adapters
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 PIPELINE_REPO = "julianhernandez-tech/bdlb"
-DASHBOARD_VERSION = "v0.7"
+DASHBOARD_VERSION = "v0.8"
 
 # The 7 lesson-build phases (P0–P6) the dashboard visualizes.
 # These are the per-lesson pipeline phases, distinct from the B0–B4 phases
@@ -525,11 +527,332 @@ def render_phase_card(run_id: str, phase_id: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# API key + spec-loader helpers (used by the Run tab)
+# ---------------------------------------------------------------------------
+def get_api_keys() -> dict[str, str]:
+    """Resolve provider API keys from Streamlit secrets or env vars."""
+    keys: dict[str, str] = {}
+    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+        v = None
+        try:
+            v = st.secrets.get(k)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if not v:
+            v = os.environ.get(k)
+        if v:
+            keys[k] = str(v).strip()
+    return keys
+
+
+def agent_spec_loader_github() -> engine.AgentSpecLoader:
+    """Build an AgentSpecLoader that reads agent .md specs from the bdlb repo."""
+    def _load(path: str) -> str:
+        text, _ = fetch_file_text(_token_fingerprint(), path)
+        if text is None:
+            raise RuntimeError(f"Agent spec not found: {path}")
+        return text
+    return engine.AgentSpecLoader(_load)
+
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_workflow, tab_costs, tab_editor = st.tabs(
-    ["🗺️ Workflow", "💰 Costs", "✏️ Editor"]
+tab_run, tab_workflow, tab_costs, tab_editor = st.tabs(
+    ["▶️ Run", "🗺️ Workflow", "💰 Costs", "✏️ Editor"]
 )
+
+# ---------------------------------------------------------------------------
+# Tab 0 — Run (generation engine)
+# ---------------------------------------------------------------------------
+with tab_run:
+    st.subheader("Run a new lesson build")
+
+    api_keys = get_api_keys()
+    have_anthropic = "ANTHROPIC_API_KEY" in api_keys
+    have_openai = "OPENAI_API_KEY" in api_keys
+    have_google = "GOOGLE_API_KEY" in api_keys
+
+    # Provider status row
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.markdown(f"{'🟢' if have_anthropic else '⚪'} Anthropic")
+    pc2.markdown(f"{'🟢' if have_openai else '⚪'} OpenAI")
+    pc3.markdown(f"{'🟢' if have_google else '⚪'} Gemini")
+    pc4.markdown(f"{'🟢' if connected else '⚪'} GitHub")
+
+    if not (have_anthropic or have_openai or have_google):
+        st.warning(
+            "No provider API keys configured. Add at least one to Streamlit Cloud → "
+            "Settings → Secrets (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY)."
+        )
+
+    if not connected:
+        st.warning("GitHub is not connected — agent .md specs cannot be loaded. "
+                   "Add GITHUB_TOKEN to Streamlit secrets or paste a token in the sidebar.")
+
+    st.markdown("#### Inputs")
+    ic1, ic2 = st.columns([2, 1])
+    with ic1:
+        seed_file = st.file_uploader(
+            "Seed question image (PNG/JPG)",
+            type=["png", "jpg", "jpeg"],
+            key="seed_upload",
+        )
+    with ic2:
+        grade_hint = st.selectbox(
+            "Grade hint (optional)",
+            options=[None, 3, 4, 5, 6, 7, 8],
+            format_func=lambda g: "(none)" if g is None else f"Grade {g}",
+            key="grade_hint",
+        )
+
+    # Build model dropdown from configured providers
+    available_models: list[str] = []
+    if have_anthropic:
+        available_models += engine.ANTHROPIC_MODELS
+    if have_openai:
+        available_models += engine.OPENAI_MODELS
+    if have_google:
+        available_models += engine.GEMINI_MODELS
+
+    st.markdown("#### Model assignment")
+    if not available_models:
+        st.info("Configure at least one provider key to assign models.")
+        orchestrator_model = None
+        agent_model_map: dict[str, str] = {}
+    else:
+        # Sensible defaults: Claude Sonnet for orchestrator (good reasoner, JSON-friendly);
+        # Gemini for vision agents (cheap + multimodal); Claude Sonnet for authoring.
+        def _default(preferred: list[str]) -> str:
+            for p in preferred:
+                for m in available_models:
+                    if p in m:
+                        return m
+            return available_models[0]
+
+        default_orch = _default(["claude-sonnet-4", "claude-3-5-sonnet", "gpt-4o", "gemini-2.5-pro"])
+        default_vision = _default(["gemini-2.5-pro", "claude-sonnet-4", "gpt-4o"])
+        default_author = _default(["claude-sonnet-4", "claude-3-5-sonnet", "gpt-4o"])
+        default_qc = _default(["gpt-4o-mini", "claude-3-5-haiku", "gemini-2.0-flash", "claude-sonnet-4"])
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            orchestrator_model = st.selectbox(
+                "Orchestrator model (router)",
+                options=available_models,
+                index=available_models.index(default_orch) if default_orch in available_models else 0,
+                key="orch_model",
+                help="This model receives the run state each turn and emits JSON dispatch decisions.",
+            )
+            vision_model = st.selectbox(
+                "Vision agents (seed extractor, image-*)",
+                options=available_models,
+                index=available_models.index(default_vision) if default_vision in available_models else 0,
+                key="vision_model",
+            )
+        with mc2:
+            author_model = st.selectbox(
+                "Authoring agents (lesson plan, items, article)",
+                options=available_models,
+                index=available_models.index(default_author) if default_author in available_models else 0,
+                key="author_model",
+            )
+            qc_model = st.selectbox(
+                "QC agents (deterministic + smart QC)",
+                options=available_models,
+                index=available_models.index(default_qc) if default_qc in available_models else 0,
+                key="qc_model",
+            )
+
+        agent_model_map = {}
+
+        def model_for_agent(agent_name: str) -> str:
+            n = agent_name.lower()
+            if n in engine.VISION_AGENTS:
+                return vision_model
+            if "qc" in n:
+                return qc_model
+            return author_model
+
+    st.markdown("#### Run options")
+    rc1, rc2, rc3 = st.columns(3)
+    with rc1:
+        max_turns = st.number_input("Max orchestrator turns", min_value=5, max_value=200,
+                                    value=40, step=5, help="Safety stop for the orchestrator loop.")
+    with rc2:
+        run_id_override = st.text_input("Run ID (optional)",
+                                        placeholder=f"e.g. test_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    with rc3:
+        push_on_complete = st.checkbox("Push to bdlb/runs/ on complete", value=False,
+                                       help="When the run finishes, commit every produced file to the bdlb pipeline repo.")
+
+    can_run = bool(seed_file and orchestrator_model and connected)
+    start = st.button("▶️ Start run", type="primary", disabled=not can_run, use_container_width=True)
+
+    # Live stream container
+    live = st.container(border=True)
+
+    if start and can_run:
+        import asyncio
+        import io
+
+        seed_bytes = seed_file.getvalue()
+        seed_name = seed_file.name
+        run_id = (run_id_override.strip()
+                  or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+
+        # Show the seed image up top
+        live.markdown(f"##### 🌱 Seed: `{seed_name}`  ·  run_id: `{run_id}`")
+        live.image(seed_bytes, width=320)
+
+        # Metrics row that updates as events stream in
+        live.divider()
+        metric_row = live.columns(4)
+        m_turn = metric_row[0].empty()
+        m_phase = metric_row[1].empty()
+        m_cost = metric_row[2].empty()
+        m_tokens = metric_row[3].empty()
+        m_turn.metric("Turn", 0)
+        m_phase.metric("Phase", "—")
+        m_cost.metric("Cost", "$0.00")
+        m_tokens.metric("Tokens", "0")
+
+        log_area = live.container()
+
+        spec_loader = agent_spec_loader_github()
+
+        async def _drive():
+            async for ev in engine.run_pipeline(
+                run_id=run_id,
+                seed_image_bytes=seed_bytes,
+                seed_image_name=seed_name,
+                grade_hint=grade_hint,
+                spec_loader=spec_loader,
+                orchestrator_model=orchestrator_model,
+                model_for_agent=model_for_agent,
+                api_keys=api_keys,
+                max_turns=int(max_turns),
+            ):
+                yield ev
+
+        # Drain the async generator
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            agen = _drive()
+            final_state: engine.RunState | None = None
+            while True:
+                try:
+                    ev = loop.run_until_complete(agen.__anext__())
+                except StopAsyncIteration:
+                    break
+                final_state = ev.get("state", final_state)
+                # Update metrics
+                if final_state is not None:
+                    m_turn.metric("Turn", final_state.turn)
+                    m_phase.metric("Phase", final_state.build_state.get("current_phase", "—"))
+                    m_cost.metric("Cost", f"${final_state.total_cost_usd:,.4f}")
+                    m_tokens.metric("Tokens",
+                                    f"{final_state.total_tokens_in + final_state.total_tokens_out:,}")
+
+                t = ev["type"]
+                if t == "started":
+                    log_area.info("Run started.")
+                elif t == "orchestrator_turn":
+                    r: engine.OrchestratorTurnRecord = ev["record"]
+                    title = f"🧠 Turn {r.turn} — Orchestrator  ·  {r.model}  ·  ${r.cost_usd:.4f}"
+                    with log_area.expander(title, expanded=False):
+                        if r.error:
+                            st.error(r.error)
+                        st.caption(f"Decision (parsed):")
+                        st.json(r.decision_parsed)
+                        with st.expander("Prompt sent (system)", expanded=False):
+                            st.code(r.prompt_system[:4000] + ("\n…[truncated]" if len(r.prompt_system) > 4000 else ""))
+                        with st.expander("Prompt sent (user)", expanded=False):
+                            st.code(r.prompt_user)
+                        with st.expander("Raw response", expanded=False):
+                            st.code(r.decision_raw)
+                elif t == "phase_change":
+                    log_area.success(f"→ Phase {ev['phase']} ({ev['status']})")
+                elif t == "agent_call":
+                    r2: engine.AgentCallRecord = ev["record"]
+                    icon = "❌" if r2.error else "✅"
+                    title = (f"{icon} Turn {r2.turn} — {r2.agent} ({r2.task_name})  ·  "
+                             f"{r2.model}  ·  {r2.tokens_in:,} in / {r2.tokens_out:,} out  ·  "
+                             f"${r2.cost_usd:.4f}  ·  {r2.elapsed_ms/1000:.1f}s")
+                    with log_area.expander(title, expanded=False):
+                        if r2.error:
+                            st.error(r2.error)
+                        if r2.output_path:
+                            st.caption(f"Output path: `{r2.output_path}`")
+                        st.caption("Output:")
+                        # Try pretty JSON if applicable
+                        try:
+                            obj = json.loads(r2.output_text)
+                            st.json(obj)
+                        except Exception:
+                            st.code(r2.output_text[:6000] +
+                                    ("\n…[truncated]" if len(r2.output_text) > 6000 else ""))
+                        with st.expander("Prompt sent (system, agent spec)", expanded=False):
+                            st.code(r2.prompt_system[:4000] +
+                                    ("\n…[truncated]" if len(r2.prompt_system) > 4000 else ""))
+                        with st.expander("Prompt sent (user, inputs)", expanded=False):
+                            st.code(r2.prompt_user)
+                elif t == "error":
+                    log_area.error(ev["message"])
+                elif t == "done":
+                    log_area.success("🏁 Run complete.")
+        finally:
+            loop.close()
+
+        # Optional: push run artifacts back to GitHub bdlb/runs/{run_id}/
+        if final_state and push_on_complete and connected:
+            client = github_client()
+            if client is not None:
+                try:
+                    repo = client.get_repo(PIPELINE_REPO)
+                    pushed = 0
+                    failed = 0
+                    # Write build_state.json
+                    bs_path = f"runs/{final_state.run_id}/build_state.json"
+                    try:
+                        repo.create_file(bs_path, f"Run {final_state.run_id} state",
+                                         json.dumps(final_state.build_state, indent=2))
+                        pushed += 1
+                    except GithubException:
+                        failed += 1
+                    # Write events as JSONL
+                    ev_path = f"runs/{final_state.run_id}/build_events.jsonl"
+                    try:
+                        repo.create_file(ev_path, f"Run {final_state.run_id} events",
+                                         "\n".join(json.dumps(e) for e in final_state.events))
+                        pushed += 1
+                    except GithubException:
+                        failed += 1
+                    # Write each produced file
+                    for path, content in final_state.files.items():
+                        if path.endswith("/" + final_state.seed_image_name):
+                            continue  # skip the placeholder for the seed image
+                        norm = path[5:] if path.startswith("bdlb/") else path  # strip leading 'bdlb/'
+                        try:
+                            repo.create_file(norm, f"Run {final_state.run_id} artifact", content)
+                            pushed += 1
+                        except GithubException:
+                            failed += 1
+                    # Push seed image as binary
+                    try:
+                        seed_path = f"runs/{final_state.run_id}/seed/{final_state.seed_image_name}"
+                        repo.create_file(seed_path, "Seed image",
+                                         final_state.seed_image_bytes or b"")
+                    except GithubException:
+                        failed += 1
+
+                    if failed == 0:
+                        live.success(f"✅ Pushed {pushed} files to {PIPELINE_REPO}/runs/{final_state.run_id}/")
+                    else:
+                        live.warning(f"Pushed {pushed} files — {failed} failed (some may have already existed).")
+                except Exception as e:
+                    live.error(f"Push failed: {type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------------
 # Tab 1 — Workflow

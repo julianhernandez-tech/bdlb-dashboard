@@ -6,3 +6,8 @@ pandas>=2.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 streamlit-ace>=0.1.1
+
+# Provider SDKs for the generation engine
+anthropic>=0.39.0
+openai>=1.50.0
+google-generativeai>=0.8.0
