@@ -236,12 +236,40 @@ def call_llm(
         )
         if response_format_json:
             kwargs["response_format"] = {"type": "json_object"}
-        # o-series models don't accept temperature
-        if model.startswith("o1") or model.startswith("o3"):
+
+        # Newer OpenAI models (o-series, gpt-5, and any future reasoning models)
+        # require `max_completion_tokens` instead of `max_tokens` and don't accept
+        # custom temperature. Detect by trying once; on the known 400 errors,
+        # rewrite kwargs and retry.
+        m_lower = model.lower()
+        needs_new_params = (
+            m_lower.startswith("o1")
+            or m_lower.startswith("o3")
+            or m_lower.startswith("o4")
+            or m_lower.startswith("gpt-5")
+        )
+        if needs_new_params:
             kwargs.pop("temperature", None)
             kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
 
-        resp = client.chat.completions.create(**kwargs)
+        def _do_call(kw: dict[str, Any]):
+            return client.chat.completions.create(**kw)
+
+        try:
+            resp = _do_call(kwargs)
+        except Exception as e:
+            msg = str(e)
+            mutated = False
+            if "max_tokens" in msg and "max_completion_tokens" in msg and "max_tokens" in kwargs:
+                kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+                mutated = True
+            if "temperature" in msg and "unsupported" in msg.lower():
+                kwargs.pop("temperature", None)
+                mutated = True
+            if mutated:
+                resp = _do_call(kwargs)
+            else:
+                raise
         text = resp.choices[0].message.content or ""
         ti = getattr(resp.usage, "prompt_tokens", 0) or 0
         to = getattr(resp.usage, "completion_tokens", 0) or 0
