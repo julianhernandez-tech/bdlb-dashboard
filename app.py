@@ -747,6 +747,97 @@ with tab_run:
     # Resolve whether we should run this script invocation
     should_run = (start and can_run) or continue_clicked
 
+    # --- Helper: render any log entry into the live container ---
+    # Defined here so it's available BOTH for live streaming (in `should_run` below)
+    # AND for re-rendering after a Streamlit rerun while paused.
+    def _render_log_entry(entry: dict, container):
+        t = entry["type"]
+        if t == "info":
+            container.info(entry["msg"])
+        elif t == "success":
+            container.success(entry["msg"])
+        elif t == "warning":
+            container.warning(entry["msg"])
+        elif t == "error":
+            container.error(entry["msg"])
+        elif t == "orchestrator_turn":
+            r = entry["record"]
+            title = f"🧠 Turn {r.turn} — Orchestrator  ·  {r.model}  ·  ${r.cost_usd:.4f}"
+            with container.expander(title, expanded=False):
+                if r.error:
+                    st.error(r.error)
+                st.caption("Decision (parsed):")
+                st.json(r.decision_parsed)
+                with st.expander("Prompt sent (system)", expanded=False):
+                    st.code(r.prompt_system[:4000] + ("\n…[truncated]" if len(r.prompt_system) > 4000 else ""))
+                with st.expander("Prompt sent (user)", expanded=False):
+                    st.code(r.prompt_user)
+                with st.expander("Raw response", expanded=False):
+                    st.code(r.decision_raw)
+        elif t == "agent_call":
+            r2 = entry["record"]
+            icon = "❌" if r2.error else "✅"
+            title = (f"{icon} Turn {r2.turn} — {r2.agent} ({r2.task_name})  ·  "
+                     f"{r2.model}  ·  {r2.tokens_in:,} in / {r2.tokens_out:,} out  ·  "
+                     f"${r2.cost_usd:.4f}  ·  {r2.elapsed_ms/1000:.1f}s")
+            with container.expander(title, expanded=False):
+                if r2.error:
+                    st.error(r2.error)
+                if r2.output_path:
+                    st.caption(f"Output path: `{r2.output_path}`")
+                st.caption("Output:")
+                try:
+                    obj = json.loads(r2.output_text)
+                    st.json(obj)
+                except Exception:
+                    st.code(r2.output_text[:6000] +
+                            ("\n…[truncated]" if len(r2.output_text) > 6000 else ""))
+                with st.expander("Prompt sent (system, agent spec)", expanded=False):
+                    st.code(r2.prompt_system[:4000] +
+                            ("\n…[truncated]" if len(r2.prompt_system) > 4000 else ""))
+                with st.expander("Prompt sent (user, inputs)", expanded=False):
+                    st.code(r2.prompt_user)
+
+    # --- If paused AND not about to resume, render the saved snapshot now ---
+    # This is what was missing: after pause + Streamlit rerun, the log was empty.
+    # Now we always show what happened so far while the run sits idle.
+    if is_resumable and not should_run:
+        paused_state: engine.RunState = st.session_state["run_paused_state"]
+        paused_log: list[dict] = st.session_state.get("run_log", [])
+        paused_seed = st.session_state.get("run_seed_bytes")
+        paused_seed_name = st.session_state.get("run_seed_name", paused_state.seed_image_name)
+
+        live.markdown(f"##### 🌱 Seed: `{paused_seed_name}`  ·  run_id: `{paused_state.run_id}`  ·  ⏸️ paused")
+        if paused_seed:
+            live.image(paused_seed, width=320)
+        live.divider()
+
+        snap_cols = live.columns(4)
+        snap_cols[0].metric("Turn", paused_state.turn)
+        snap_cols[1].metric("Phase", paused_state.build_state.get("current_phase", "—"))
+        snap_cols[2].metric("Cost", f"${paused_state.total_cost_usd:,.4f}")
+        snap_cols[3].metric("Tokens",
+                            f"{paused_state.total_tokens_in + paused_state.total_tokens_out:,}")
+
+        snap_log_area = live.container()
+        snap_log_area.markdown(f"**📜 What's happened so far ({len(paused_log)} events):**")
+        for entry in paused_log:
+            _render_log_entry(entry, snap_log_area)
+
+        # Also show the files produced so far so the user can audit before continuing
+        if paused_state.files:
+            with live.expander(f"📁 Files produced so far ({len(paused_state.files)})", expanded=False):
+                for path in sorted(paused_state.files.keys()):
+                    content = paused_state.files[path]
+                    with st.expander(path, expanded=False):
+                        if path.endswith(".json"):
+                            try:
+                                st.json(json.loads(content))
+                            except Exception:
+                                st.code(content[:10000] + ("\n…[truncated]" if len(content) > 10000 else ""))
+                        else:
+                            st.code(content[:10000] + ("\n…[truncated]" if len(content) > 10000 else ""))
+
     if should_run:
         import asyncio
 
@@ -811,57 +902,11 @@ with tab_run:
 
         log_area = live.container()
 
-        # Replay any prior log entries from the previous (paused) chunk
-        def _render_log_entry(entry: dict):
-            t = entry["type"]
-            if t == "info":
-                log_area.info(entry["msg"])
-            elif t == "success":
-                log_area.success(entry["msg"])
-            elif t == "warning":
-                log_area.warning(entry["msg"])
-            elif t == "error":
-                log_area.error(entry["msg"])
-            elif t == "orchestrator_turn":
-                r = entry["record"]
-                title = f"🧠 Turn {r.turn} — Orchestrator  ·  {r.model}  ·  ${r.cost_usd:.4f}"
-                with log_area.expander(title, expanded=False):
-                    if r.error:
-                        st.error(r.error)
-                    st.caption("Decision (parsed):")
-                    st.json(r.decision_parsed)
-                    with st.expander("Prompt sent (system)", expanded=False):
-                        st.code(r.prompt_system[:4000] + ("\n…[truncated]" if len(r.prompt_system) > 4000 else ""))
-                    with st.expander("Prompt sent (user)", expanded=False):
-                        st.code(r.prompt_user)
-                    with st.expander("Raw response", expanded=False):
-                        st.code(r.decision_raw)
-            elif t == "agent_call":
-                r2 = entry["record"]
-                icon = "❌" if r2.error else "✅"
-                title = (f"{icon} Turn {r2.turn} — {r2.agent} ({r2.task_name})  ·  "
-                         f"{r2.model}  ·  {r2.tokens_in:,} in / {r2.tokens_out:,} out  ·  "
-                         f"${r2.cost_usd:.4f}  ·  {r2.elapsed_ms/1000:.1f}s")
-                with log_area.expander(title, expanded=False):
-                    if r2.error:
-                        st.error(r2.error)
-                    if r2.output_path:
-                        st.caption(f"Output path: `{r2.output_path}`")
-                    st.caption("Output:")
-                    try:
-                        obj = json.loads(r2.output_text)
-                        st.json(obj)
-                    except Exception:
-                        st.code(r2.output_text[:6000] +
-                                ("\n…[truncated]" if len(r2.output_text) > 6000 else ""))
-                    with st.expander("Prompt sent (system, agent spec)", expanded=False):
-                        st.code(r2.prompt_system[:4000] +
-                                ("\n…[truncated]" if len(r2.prompt_system) > 4000 else ""))
-                    with st.expander("Prompt sent (user, inputs)", expanded=False):
-                        st.code(r2.prompt_user)
-
+        # Replay any prior log entries from a previous (paused) chunk
+        if log_entries:
+            log_area.markdown(f"**📜 Resuming — replaying {len(log_entries)} prior events:**")
         for entry in log_entries:
-            _render_log_entry(entry)
+            _render_log_entry(entry, log_area)
 
         spec_loader = agent_spec_loader_github()
 
@@ -906,26 +951,26 @@ with tab_run:
                 t = ev["type"]
                 if t == "started":
                     entry = {"type": "info", "msg": "Run started."}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "orchestrator_turn":
                     entry = {"type": "orchestrator_turn", "record": ev["record"]}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "phase_change":
                     entry = {"type": "success", "msg": f"→ Phase {ev['phase']} ({ev['status']})"}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "agent_call":
                     entry = {"type": "agent_call", "record": ev["record"]}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "paused":
                     was_paused = True
                     entry = {"type": "warning", "msg": f"⏸️ Paused: {ev['reason']}"}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "error":
                     entry = {"type": "error", "msg": ev["message"]}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
                 elif t == "done":
                     entry = {"type": "success", "msg": "🏁 Run complete."}
-                    log_entries.append(entry); _render_log_entry(entry)
+                    log_entries.append(entry); _render_log_entry(entry, log_area)
         finally:
             loop.close()
 
